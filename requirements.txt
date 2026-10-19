@@ -1,8 +1,5 @@
-   streamlit
-   pandas
-   openpyxl
-   requests
-   beautifulsoup4
-   Pillow
-   python-pptx
-   xlsxwriter
+streamlit
+openpyxl
+Pillow
+python-pptx
+pyarrow<25
