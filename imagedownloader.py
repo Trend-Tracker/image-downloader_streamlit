@@ -1,5 +1,5 @@
 """
-Images to ZIP + PPT maker - Streamlit app.
+Images to ZIP + PPT maker - Streamlit app (low-memory version).
 
 Three ways to use it:
   1. Upload Excel  -> downloads every image column, files named  <StoreCode>_<ColumnName>[_n].jpg
@@ -8,15 +8,24 @@ Three ways to use it:
                       (Store front | Before deployment | After deployment)
                       with a blue header: client store code + store name
 
+Why this version does not crash on ~3,000 images:
+  * Images are written straight into ZIP files on disk and thrown away from memory.
+  * Output is split into parts (e.g. 200 images per ZIP, 40 outlets per PPT).
+  * Only one part is held in memory at a time (also when you click Download).
+  * Photos are decoded at reduced size and shrunk before they go into the PPT.
+
 Run locally:
     pip install streamlit openpyxl python-pptx pillow
-    streamlit run app.py
+    streamlit run imagedownloader.py
 """
 import base64
+import gc
 import io
 import math
 import mimetypes
 import re
+import shutil
+import tempfile
 import zipfile
 from datetime import date, datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -36,8 +45,51 @@ from pptx.util import Inches, Pt
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36"}
 URL_RE = re.compile(r"https?://[^\s,\"'<>]+", re.I)
 
-# Channelplay logo (small fallback, cropped from your slide). Upload a sharper one in the app if you have it.
-DEFAULT_LOGO_B64 = "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"
+MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024   # skip a single file bigger than this
+FETCH_CHUNK = 24                        # how many images are in flight at once (keeps RAM low)
+DEFAULT_IMAGES_PER_ZIP = 200
+DEFAULT_OUTLETS_PER_PPT = 40
+
+# Built-in logo (base64 JPG/PNG). Leave empty to show the text "Channelplay" on slides,
+# or upload your logo inside the app.
+DEFAULT_LOGO_B64 = ""
+
+
+# --------------------------------------------------------------------------
+# Temp-folder helpers (big files live on disk, not in RAM)
+# --------------------------------------------------------------------------
+def fresh_workdir(key: str) -> Path:
+    """New temp folder for this kind of output; the previous one is deleted."""
+    old = st.session_state.pop(f"{key}_dir", None)
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+    path = tempfile.mkdtemp(prefix=f"{key}_")
+    st.session_state[f"{key}_dir"] = path
+    return Path(path)
+
+
+def show_download(parts, key, label, mime):
+    """One download button. With several parts, pick the part first (only one part is loaded in RAM)."""
+    if not parts:
+        return
+    if len(parts) > 1:
+        st.info(f"The output is split into {len(parts)} parts to keep the app fast and stable. "
+                f"Pick a part, download it, then pick the next one.")
+        i = st.selectbox(
+            "Part to download", list(range(len(parts))), key=f"{key}_part",
+            format_func=lambda n: (f"Part {n + 1} of {len(parts)} - {parts[n]['count']} {parts[n]['unit']}"
+                                   f" ({parts[n]['mb']:.0f} MB)"),
+        )
+    else:
+        i = 0
+    part = parts[i]
+    path = Path(part["path"])
+    if not path.exists():
+        st.error("This file is no longer on the server (the app restarted). Please create it again.")
+        return
+    with open(path, "rb") as f:
+        st.download_button(label if len(parts) == 1 else f"{label} - part {i + 1}", data=f.read(),
+                           file_name=part["name"], mime=mime, type="primary", key=f"{key}_dl_{i}")
 
 
 # --------------------------------------------------------------------------
@@ -86,7 +138,17 @@ def cell_urls(cell) -> list[str]:
     return urls
 
 
+@st.cache_resource(show_spinner=False, max_entries=2)
+def get_sheetnames(file_bytes: bytes) -> list[str]:
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True)
+    names = list(wb.sheetnames)
+    wb.close()
+    return names
+
+
+@st.cache_resource(show_spinner="Reading Excel...", max_entries=2)
 def read_workbook(file_bytes: bytes, sheet_name=None):
+    """Cached, so the workbook is parsed once and not on every click."""
     wb = load_workbook(io.BytesIO(file_bytes))  # not read_only: hyperlinks need full mode
     ws = wb[sheet_name] if sheet_name else wb.active
     headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
@@ -126,48 +188,78 @@ def ext_for(url: str, content_type: str) -> str:
     return mimetypes.guess_extension((content_type or "").split(";")[0]) or ".jpg"
 
 
+def fetch_raw(url: str):
+    """Download one URL -> (bytes, content type). Retries once on network errors."""
+    last = None
+    for _ in range(2):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read(MAX_DOWNLOAD_BYTES + 1)
+                ctype = resp.headers.get("Content-Type", "")
+            if len(data) > MAX_DOWNLOAD_BYTES:
+                raise ValueError("file is too large")
+            if ctype.startswith(("text/", "application/json")):
+                raise ValueError(f"got a web page instead of an image ({ctype})")
+            return data, ctype
+        except ValueError:
+            raise                                     # retrying will not help
+        except Exception as err:
+            last = err
+    raise last
+
+
 def fetch(job):
     try:
-        req = urllib.request.Request(job["url"], headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
-            ctype = resp.headers.get("Content-Type", "")
-        if ctype.startswith(("text/", "application/json")):
-            raise ValueError(f"got a web page instead of an image ({ctype})")
+        data, ctype = fetch_raw(job["url"])
         return {**job, "name": job["stem"] + ext_for(job["url"], ctype), "data": data, "error": None}
     except Exception as err:
         return {**job, "name": None, "data": None, "error": str(err)}
 
 
-def run_jobs(jobs, zip_name):
+def run_jobs(jobs, zip_name, per_zip):
+    """Download images and write them straight into ZIP files on disk, `per_zip` images per file."""
+    workdir = fresh_workdir("zip")
+    base = re.sub(r"[^\w\- ]+", "_", zip_name.strip() or "images")
+    n_parts = max(1, math.ceil(len(jobs) / per_zip))
     progress = st.progress(0.0, text=f"Fetching 0 of {len(jobs)}...")
-    results = []
+
+    report, parts, done = [], [], 0
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for done, res in enumerate(pool.map(fetch, jobs), start=1):
-            results.append(res)
-            progress.progress(done / len(jobs), text=f"Fetching {done} of {len(jobs)}...")
+        for p in range(n_parts):
+            part_jobs = jobs[p * per_zip:(p + 1) * per_zip]
+            fname = f"{base}.zip" if n_parts == 1 else f"{base}_part{p + 1}.zip"
+            path = workdir / fname
+            added = 0
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+                for i in range(0, len(part_jobs), FETCH_CHUNK):
+                    for r in pool.map(fetch, part_jobs[i:i + FETCH_CHUNK]):
+                        if not r["error"]:
+                            zf.writestr(r["name"], r["data"])
+                            added += 1
+                        report.append({
+                            "Store Code": r.get("code", ""),
+                            "Column": r.get("column", ""),
+                            "Link": r["url"],
+                            "Status": "Added" if not r["error"] else "Failed",
+                            "Details": r["name"] or r["error"],
+                        })
+                        r["data"] = None              # free the image right away
+                        done += 1
+                        progress.progress(done / len(jobs),
+                                          text=f"Fetching {done} of {len(jobs)}  (ZIP part {p + 1} of {n_parts})...")
+            if added:
+                parts.append({"path": str(path), "name": fname, "count": added, "unit": "images",
+                              "mb": path.stat().st_size / 1024 / 1024})
+            else:
+                path.unlink(missing_ok=True)
+            gc.collect()
     progress.empty()
 
-    good = [r for r in results if not r["error"]]
-    report = [
-        {
-            "Store Code": r.get("code", ""),
-            "Column": r.get("column", ""),
-            "Link": r["url"],
-            "Status": "Added" if not r["error"] else "Failed",
-            "Details": r["name"] or r["error"],
-        }
-        for r in results
-    ]
-    out = {"bytes": None, "report": report, "good": len(good), "total": len(results),
-           "name": re.sub(r"[^\w\- ]+", "_", zip_name.strip() or "images") + ".zip"}
-    if good:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-            for r in good:
-                zf.writestr(r["name"], r["data"])
-        out["bytes"] = buf.getvalue()
-    st.session_state["zip_result"] = out
+    st.session_state["zip_result"] = {
+        "parts": parts, "report": report,
+        "good": sum(p["count"] for p in parts), "total": len(jobs),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -233,13 +325,15 @@ COL_GAP = 0.25
 COLUMNS = [("front", "Store Front"), ("before", "Before Deployment"), ("after", "After Deployment")]
 
 
-def prep_image(data: bytes, max_side=1400):
+def prep_image(data: bytes, max_side=1200):
     """Fix phone-photo rotation, shrink and re-encode so the PPT stays small. -> (jpeg bytes, (w, h))"""
     try:
-        im = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        im = Image.open(io.BytesIO(data))
+        im.draft("RGB", (max_side, max_side))          # JPEG: decode at reduced size = far less RAM
+        im = ImageOps.exif_transpose(im).convert("RGB")
         im.thumbnail((max_side, max_side))
         buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=82, optimize=True)
+        im.save(buf, "JPEG", quality=80, optimize=True)
         return buf.getvalue(), im.size
     except Exception:
         return None
@@ -427,20 +521,86 @@ def build_entries(ws, headers, cols, rows=None, active_keys=None):
     return entries
 
 
-def download_all(urls, workers=8):
-    """url -> prepared image (or None). Returns (images, failures)."""
-    progress = st.progress(0.0, text=f"Downloading 0 of {len(urls)} images...")
-    images, failures = {}, []
-    jobs = [{"url": u, "stem": "x"} for u in urls]
+def fetch_prepared(url):
+    """Download + shrink one image inside the worker thread, so only the small version is kept."""
+    try:
+        data, _ = fetch_raw(url)
+        prepared = prep_image(data)
+        if prepared is None:
+            return url, None, "not a readable image"
+        return url, prepared, None
+    except Exception as err:
+        return url, None, str(err)
+
+
+def download_all(urls, label="Images", workers=6):
+    """url -> prepared image (or None), for one part only. Returns (images, failures)."""
+    progress = st.progress(0.0, text=f"{label}: downloading 0 of {len(urls)} images...")
+    images, failures, done = {}, [], 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for done, res in enumerate(pool.map(fetch, jobs), start=1):
-            prepared = prep_image(res["data"]) if not res["error"] else None
-            images[res["url"]] = prepared
-            if prepared is None:
-                failures.append({"Link": res["url"], "Reason": res["error"] or "not a readable image"})
-            progress.progress(done / len(urls), text=f"Downloading {done} of {len(urls)} images...")
+        for i in range(0, len(urls), FETCH_CHUNK):
+            for url, prepared, err in pool.map(fetch_prepared, urls[i:i + FETCH_CHUNK]):
+                images[url] = prepared
+                if prepared is None:
+                    failures.append({"Link": url, "Reason": err or "not a readable image"})
+                done += 1
+                progress.progress(done / max(len(urls), 1),
+                                  text=f"{label}: downloading {done} of {len(urls)} images...")
     progress.empty()
     return images, failures
+
+
+def create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles, per_outlet_zip, outlets_per_part):
+    """Build the PPT(s) part by part. Images of one part are downloaded, used, then dropped from memory."""
+    workdir = fresh_workdir("ppt")
+
+    # split the outlets into parts (in per-outlet mode an outlet code is never split across parts)
+    chunks = []
+    if per_outlet_zip:
+        by_code = {}
+        for e in entries:
+            by_code.setdefault(e["code"], []).append(e)
+        cur = []
+        for items in by_code.values():
+            cur += items
+            if len(cur) >= outlets_per_part:
+                chunks.append(cur)
+                cur = []
+        if cur:
+            chunks.append(cur)
+    else:
+        chunks = [entries[i:i + outlets_per_part] for i in range(0, len(entries), outlets_per_part)]
+
+    base = "outlet_ppts" if per_outlet_zip else "outlet_report"
+    ext = ".zip" if per_outlet_zip else ".pptx"
+    parts, failures, total_urls = [], [], 0
+    note = st.empty()
+    for n, chunk in enumerate(chunks, start=1):
+        label = f"Part {n} of {len(chunks)}"
+        urls = list(dict.fromkeys(u for e in chunk for k, _ in active for u in e[k]))
+        images, fails = download_all(urls, label)
+        failures += fails
+        total_urls += len(urls)
+
+        note.info(f"{label}: building PowerPoint...")
+        fname = f"{base}{ext}" if len(chunks) == 1 else f"{base}_part{n}{ext}"
+        path = workdir / fname
+        if per_outlet_zip:
+            groups = {}
+            for e in chunk:
+                groups.setdefault(e["code"], []).append(e)
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
+                for code, items in groups.items():
+                    zf.writestr(f"{clean(code)}_{clean(items[0]['name'])}.pptx".replace("_.pptx", ".pptx"),
+                                build_deck(items, images, logo_bytes, w_sub, active, show_titles))
+        else:
+            path.write_bytes(build_deck(chunk, images, logo_bytes, w_sub, active, show_titles))
+        parts.append({"path": str(path), "name": fname, "count": len(chunk), "unit": "outlets",
+                      "mb": path.stat().st_size / 1024 / 1024})
+        del images
+        gc.collect()
+    note.empty()
+    return parts, failures, total_urls
 
 
 # --------------------------------------------------------------------------
@@ -451,6 +611,23 @@ def pick(headers, *needles, default=0):
         if h and all(n in h.lower() for n in needles):
             return i
     return default
+
+
+def default_logo() -> bytes:
+    """Built-in logo. If it cannot be decoded, return b"" and the slides show the text "Channelplay" instead."""
+    try:
+        raw = base64.b64decode(DEFAULT_LOGO_B64 + "=" * (-len(DEFAULT_LOGO_B64) % 4))
+        Image.open(io.BytesIO(raw)).load()
+        return raw
+    except Exception:
+        return b""
+
+
+def per_zip_input(key):
+    return st.number_input(
+        "Images per ZIP part", min_value=20, max_value=1000, value=DEFAULT_IMAGES_PER_ZIP, step=20, key=key,
+        help="Large jobs are split into several ZIP files so the app does not run out of memory. "
+             "If the app still crashes, lower this number.")
 
 
 def main():
@@ -468,7 +645,7 @@ def main():
         up = st.file_uploader("Excel file", type=["xlsx", "xlsm"], key="up_zip")
         if up:
             file_bytes = up.getvalue()
-            sheets = load_workbook(io.BytesIO(file_bytes), read_only=True).sheetnames
+            sheets = get_sheetnames(file_bytes)
             sheet = st.selectbox("Sheet", sheets, key="sh_zip") if len(sheets) > 1 else sheets[0]
             wb, ws, headers = read_workbook(file_bytes, sheet)
             named = [h for h in headers if h]
@@ -482,12 +659,17 @@ def main():
             st.caption(f"{len(jobs)} image{'s' if len(jobs) != 1 else ''} found in {ws.max_row - 1 if rows is None else len(rows)} rows")
             if jobs:
                 with st.expander("Preview file names"):
-                    st.dataframe([{"File": j["stem"] + ".jpg", "Link": j["url"]} for j in jobs], hide_index=True)
+                    st.dataframe([{"File": j["stem"] + ".jpg", "Link": j["url"]} for j in jobs[:500]], hide_index=True)
+                    if len(jobs) > 500:
+                        st.caption(f"Showing the first 500 of {len(jobs)}.")
 
-            zip_name_x = st.text_input("ZIP file name", value="images", key="zip_x")
+            c1, c2 = st.columns(2)
+            zip_name_x = c1.text_input("ZIP file name", value="images", key="zip_x")
+            with c2:
+                per_zip_x = per_zip_input("per_zip_x")
             if st.button("Prepare ZIP", type="primary", disabled=not jobs, key="go_x"):
                 st.session_state.pop("zip_result", None)
-                run_jobs(jobs, zip_name_x)
+                run_jobs(jobs, zip_name_x, int(per_zip_x))
 
     # ---------------- Paste links -> ZIP ----------------
     with tab_links:
@@ -497,9 +679,11 @@ def main():
                            placeholder="https://example.com/photo1.jpg\nhttps://example.com/photo2.png")
         links = parse_links(raw)
 
-        col1, col2 = st.columns([3, 1], vertical_alignment="bottom")
+        col1, col2, col3 = st.columns([3, 2, 1], vertical_alignment="bottom")
         zip_name_l = col1.text_input("ZIP file name", value="images", key="zip_l")
-        col2.caption(f"{len(links)} link{'s' if len(links) != 1 else ''}")
+        with col2:
+            per_zip_l = per_zip_input("per_zip_l")
+        col3.caption(f"{len(links)} link{'s' if len(links) != 1 else ''}")
 
         if st.button("Prepare ZIP", type="primary", disabled=not links, key="go_l"):
             st.session_state.pop("zip_result", None)
@@ -507,17 +691,16 @@ def main():
             for i, u in enumerate(links):
                 base = re.sub(r"[^\w.\-]+", "_", unquote(Path(urlparse(u).path).name) or "image")
                 jobs.append({"url": u, "stem": f"{i + 1:03d}_{Path(base).stem}", "code": "", "column": ""})
-            run_jobs(jobs, zip_name_l)
+            run_jobs(jobs, zip_name_l, int(per_zip_l))
 
     # ---------------- ZIP result (shared by the two tabs above) ----------------
     result = st.session_state.get("zip_result")
     if result:
         st.divider()
-        if result["bytes"]:
+        if result["parts"]:
             msg = f"{result['good']} of {result['total']} images are ready."
             (st.success if result["good"] == result["total"] else st.warning)(msg)
-            st.download_button("Download ZIP", data=result["bytes"], file_name=result["name"],
-                               mime="application/zip", type="primary")
+            show_download(result["parts"], "zip", "Download ZIP", "application/zip")
         else:
             st.error("No images could be downloaded. Check that the links point directly to image files.")
         st.dataframe(result["report"], width="stretch", hide_index=True)
@@ -531,7 +714,7 @@ def main():
         up = st.file_uploader("Excel file", type=["xlsx", "xlsm"], key="up_ppt")
         if up:
             file_bytes = up.getvalue()
-            sheets = load_workbook(io.BytesIO(file_bytes), read_only=True).sheetnames
+            sheets = get_sheetnames(file_bytes)
             sheet = st.selectbox("Sheet", sheets, key="sh_ppt") if len(sheets) > 1 else sheets[0]
             wb, ws, headers = read_workbook(file_bytes, sheet)
             named = [h for h in headers if h]
@@ -574,9 +757,14 @@ def main():
             w_sub = st.text_input("Subtitle (optional)", value="")
             logo_up = st.file_uploader("Logo (optional – a sharper Channelplay logo, PNG/JPG)",
                                        type=["png", "jpg", "jpeg"])
-            logo_bytes = logo_up.getvalue() if logo_up else base64.b64decode(DEFAULT_LOGO_B64)
+            logo_bytes = logo_up.getvalue() if logo_up else default_logo()
 
-            mode = st.radio("Output", ["One PPT with all outlets", "One PPT per outlet (ZIP)"], horizontal=True)
+            o1, o2 = st.columns([3, 2])
+            mode = o1.radio("Output", ["One PPT with all outlets", "One PPT per outlet (ZIP)"], horizontal=True)
+            per_part = o2.number_input(
+                "Outlets per file", min_value=10, max_value=200, value=DEFAULT_OUTLETS_PER_PPT, step=10,
+                help="Big jobs are split into several files so the app does not run out of memory. "
+                     "If the app still crashes, lower this number.")
 
             cols = {"front": front_col, "before": before_col, "after": after_col, "code": code_col,
                     "client": None if client_col == NONE else client_col,
@@ -589,27 +777,21 @@ def main():
                 st.caption("Header preview: " + entries[0]["title"]
                            + (f"   |   Welcome slide: {entries[0]['campaign']}" if entries[0]["campaign"] else ""))
             all_urls = list(dict.fromkeys(u for e in entries for k, _ in active for u in e[k]))
-            st.caption(f"{len(entries)} outlet slide{'s' if len(entries) != 1 else ''}, {len(all_urls)} images")
+            n_files = math.ceil(len(entries) / int(per_part)) if entries else 0
+            st.caption(f"{len(entries)} outlet slide{'s' if len(entries) != 1 else ''}, {len(all_urls)} images"
+                       + (f"  →  {n_files} file{'s' if n_files != 1 else ''}" if n_files > 1 else ""))
 
             if st.button("Create PPT", type="primary", disabled=not entries, key="go_ppt"):
                 st.session_state.pop("ppt_result", None)
-                images, failures = download_all(all_urls)
-                with st.spinner("Building PowerPoint..."):
-                    if mode.startswith("One PPT with"):
-                        data = build_deck(entries, images, logo_bytes, w_sub, active, show_titles)
-                        name, mime = "outlet_report.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    else:
-                        groups = {}
-                        for e in entries:
-                            groups.setdefault(e["code"], []).append(e)
-                        buf = io.BytesIO()
-                        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-                            for code, items in groups.items():
-                                zf.writestr(f"{clean(code)}_{clean(items[0]['name'])}.pptx".replace("_.pptx", ".pptx"),
-                                            build_deck(items, images, logo_bytes, w_sub, active, show_titles))
-                        data, name, mime = buf.getvalue(), "outlet_ppts.zip", "application/zip"
-                st.session_state["ppt_result"] = {"bytes": data, "name": name, "mime": mime,
-                                                  "failures": failures, "total": len(all_urls)}
+                per_outlet_zip = not mode.startswith("One PPT with")
+                parts, failures, total = create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles,
+                                                          per_outlet_zip, int(per_part))
+                st.session_state["ppt_result"] = {
+                    "parts": parts, "failures": failures, "total": total,
+                    "mime": "application/zip" if per_outlet_zip else
+                            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "label": "Download ZIP of PPTs" if per_outlet_zip else "Download PPT",
+                }
 
         pres = st.session_state.get("ppt_result")
         if pres:
@@ -618,8 +800,7 @@ def main():
             (st.success if not pres["failures"] else st.warning)(
                 f"PPT ready. {ok} of {pres['total']} images placed."
                 + ("" if not pres["failures"] else " Missing ones show “Image not available”."))
-            st.download_button("Download PPT", data=pres["bytes"], file_name=pres["name"],
-                               mime=pres["mime"], type="primary")
+            show_download(pres["parts"], "ppt", pres["label"], pres["mime"])
             if pres["failures"]:
                 st.dataframe(pres["failures"], width="stretch", hide_index=True)
 
