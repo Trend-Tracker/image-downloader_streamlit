@@ -1,4 +1,7 @@
-streamlit
-openpyxl
-Pillow
-python-pptx
+   streamlit
+   pandas
+   openpyxl
+   requests
+   beautifulsoup4
+   Pillow
+   xlsxwriter
