@@ -48,7 +48,8 @@ URL_RE = re.compile(r"https?://[^\s,\"'<>]+", re.I)
 MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024   # skip a single file bigger than this
 FETCH_CHUNK = 24                        # how many images are in flight at once (keeps RAM low)
 DEFAULT_IMAGES_PER_ZIP = 200
-DEFAULT_OUTLETS_PER_PPT = 40
+MAX_OUTLETS_PER_PPT = 500              # upper limit of the "Outlets per file" box
+ZIP_BUNDLE_MAX_MB = 800                # split files are bundled into ONE zip only up to this total size
 
 # Built-in logo (base64 JPG/PNG). Leave empty to show the text "Channelplay" on slides,
 # or upload your logo inside the app.
@@ -470,7 +471,33 @@ def add_outlet_slide(prs, entry, logo_bytes, images, active, show_titles=False):
             add_image_box(slide, images.get(url), box)
 
 
-def build_deck(entries, images, logo_bytes, welcome_sub="", active=COLUMNS, show_titles=False):
+def chunk_list(items, size):
+    """Cut a list into consecutive parts of at most `size` items."""
+    return [items[i:i + size] for i in range(0, len(items), size)] or [[]]
+
+
+def good_fit(n, cap=MAX_OUTLETS_PER_PPT):
+    """Best outlets-per-file for n outlets: one file up to the cap, otherwise equal-sized files.
+    211 -> 211 (one file) | 1200 -> 600 (2 files) | 5000 -> 1000 (5 files) | 2500 -> 834 (3 files)"""
+    n = max(int(n), 1)
+    if n <= cap:
+        return n
+    parts = math.ceil(n / cap)
+    return math.ceil(n / parts)
+
+
+def split_entries(entries):
+    """Group entries by their split value (case-insensitive, blank -> 'Unassigned'). -> {label: [entries]}"""
+    groups, labels = {}, {}
+    for e in entries:
+        label = (e.get("group") or "").strip() or "Unassigned"
+        k = label.casefold()
+        labels.setdefault(k, label)
+        groups.setdefault(k, []).append(e)
+    return {labels[k]: v for k, v in groups.items()}
+
+
+def build_deck(entries, images, logo_bytes, welcome_sub="", active=COLUMNS, show_titles=False, out=None):
     """Welcome slide per campaign (name from the Excel) + its outlet slides, then a closing Thank You slide."""
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(SLIDE_W), Inches(SLIDE_H)
@@ -483,6 +510,9 @@ def build_deck(entries, images, logo_bytes, welcome_sub="", active=COLUMNS, show
         for e in items:
             add_outlet_slide(prs, e, logo_bytes, images, active, show_titles)
     add_thanks(prs, logo_bytes)
+    if out is not None:                      # straight to disk: no second copy of the deck in RAM
+        prs.save(str(out))
+        return None
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
@@ -517,15 +547,16 @@ def build_entries(ws, headers, cols, rows=None, active_keys=None):
         if key in seen:
             continue
         seen.add(key)
-        entries.append({"code": code, "name": text("name"), "title": title, "campaign": campaign, **urls})
+        entries.append({"code": code, "name": text("name"), "title": title, "campaign": campaign,
+                        "group": text("split"), **urls})
     return entries
 
 
-def fetch_prepared(url):
+def fetch_prepared(url, max_side=1200):
     """Download + shrink one image inside the worker thread, so only the small version is kept."""
     try:
         data, _ = fetch_raw(url)
-        prepared = prep_image(data)
+        prepared = prep_image(data, max_side)
         if prepared is None:
             return url, None, "not a readable image"
         return url, prepared, None
@@ -533,13 +564,13 @@ def fetch_prepared(url):
         return url, None, str(err)
 
 
-def download_all(urls, label="Images", workers=6):
+def download_all(urls, label="Images", workers=6, max_side=1200):
     """url -> prepared image (or None), for one part only. Returns (images, failures)."""
     progress = st.progress(0.0, text=f"{label}: downloading 0 of {len(urls)} images...")
     images, failures, done = {}, [], 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for i in range(0, len(urls), FETCH_CHUNK):
-            for url, prepared, err in pool.map(fetch_prepared, urls[i:i + FETCH_CHUNK]):
+            for url, prepared, err in pool.map(lambda u: fetch_prepared(u, max_side), urls[i:i + FETCH_CHUNK]):
                 images[url] = prepared
                 if prepared is None:
                     failures.append({"Link": url, "Reason": err or "not a readable image"})
@@ -550,17 +581,25 @@ def download_all(urls, label="Images", workers=6):
     return images, failures
 
 
-def create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles, per_outlet_zip, outlets_per_part):
-    """Build the PPT(s) part by part. Images of one part are downloaded, used, then dropped from memory."""
+def create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles, per_outlet_zip, outlets_per_part,
+                     split_label=None):
+    """Build the PPT(s) file by file. Images of one file are downloaded, used, then dropped from memory.
+
+    Returns (parts, failures, total_urls, zipped):
+      * one file                      -> a single .pptx (no zip)
+      * several files (by column/size) -> bundled into ONE zip with readable names (East.pptx, West.pptx, ...)
+        as long as the total is <= ZIP_BUNDLE_MAX_MB; bigger jobs stay as separate files to download one by one.
+    """
     workdir = fresh_workdir("ppt")
 
-    # split the outlets into parts (in per-outlet mode an outlet code is never split across parts)
-    chunks = []
+    # ---- plan: (file name, outlets in that file) ----
+    jobs = []
     if per_outlet_zip:
+        # an outlet code is never split across parts
         by_code = {}
         for e in entries:
             by_code.setdefault(e["code"], []).append(e)
-        cur = []
+        chunks, cur = [], []
         for items in by_code.values():
             cur += items
             if len(cur) >= outlets_per_part:
@@ -568,22 +607,34 @@ def create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles, per_outlet
                 cur = []
         if cur:
             chunks.append(cur)
+        for n, chunk in enumerate(chunks, start=1):
+            jobs.append(("outlet_ppts.zip" if len(chunks) == 1 else f"outlet_ppts_part{n}.zip", chunk))
+    elif split_label:
+        used = set()
+        for label, items in split_entries(entries).items():
+            stem = clean(label) or "part"
+            while stem.casefold() in used:
+                stem += "_2"
+            used.add(stem.casefold())
+            subs = chunk_list(items, outlets_per_part)
+            for n, sub in enumerate(subs, start=1):
+                jobs.append((f"{stem}.pptx" if len(subs) == 1 else f"{stem}_part{n}.pptx", sub))
     else:
-        chunks = [entries[i:i + outlets_per_part] for i in range(0, len(entries), outlets_per_part)]
+        chunks = chunk_list(entries, outlets_per_part)
+        for n, chunk in enumerate(chunks, start=1):
+            jobs.append(("outlet_report.pptx" if len(chunks) == 1 else f"outlet_report_part{n}.pptx", chunk))
 
-    base = "outlet_ppts" if per_outlet_zip else "outlet_report"
-    ext = ".zip" if per_outlet_zip else ".pptx"
+    # ---- build ----
     parts, failures, total_urls = [], [], 0
     note = st.empty()
-    for n, chunk in enumerate(chunks, start=1):
-        label = f"Part {n} of {len(chunks)}"
+    for n, (fname, chunk) in enumerate(jobs, start=1):
+        label = f"File {n} of {len(jobs)} ({fname})"
         urls = list(dict.fromkeys(u for e in chunk for k, _ in active for u in e[k]))
         images, fails = download_all(urls, label)
         failures += fails
         total_urls += len(urls)
 
         note.info(f"{label}: building PowerPoint...")
-        fname = f"{base}{ext}" if len(chunks) == 1 else f"{base}_part{n}{ext}"
         path = workdir / fname
         if per_outlet_zip:
             groups = {}
@@ -594,13 +645,28 @@ def create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles, per_outlet
                     zf.writestr(f"{clean(code)}_{clean(items[0]['name'])}.pptx".replace("_.pptx", ".pptx"),
                                 build_deck(items, images, logo_bytes, w_sub, active, show_titles))
         else:
-            path.write_bytes(build_deck(chunk, images, logo_bytes, w_sub, active, show_titles))
+            build_deck(chunk, images, logo_bytes, w_sub, active, show_titles, out=path)
         parts.append({"path": str(path), "name": fname, "count": len(chunk), "unit": "outlets",
                       "mb": path.stat().st_size / 1024 / 1024})
         del images
         gc.collect()
     note.empty()
-    return parts, failures, total_urls
+
+    # ---- several PPT files -> one readable zip (written to disk, file by file) ----
+    zipped = False
+    if len(parts) > 1 and not per_outlet_zip and sum(p["mb"] for p in parts) <= ZIP_BUNDLE_MAX_MB:
+        zname = f"ppt_by_{clean(split_label)}.zip" if split_label else "outlet_report_parts.zip"
+        zpath = workdir / zname
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
+            for p in parts:
+                zf.write(p["path"], arcname=p["name"])
+        count = sum(p["count"] for p in parts)
+        for p in parts:
+            Path(p["path"]).unlink(missing_ok=True)
+        parts = [{"path": str(zpath), "name": zname, "count": count, "unit": "outlets",
+                  "mb": zpath.stat().st_size / 1024 / 1024}]
+        zipped = True
+    return parts, failures, total_urls, zipped
 
 
 # --------------------------------------------------------------------------
@@ -759,38 +825,71 @@ def main():
                                        type=["png", "jpg", "jpeg"])
             logo_bytes = logo_up.getvalue() if logo_up else default_logo()
 
-            o1, o2 = st.columns([3, 2])
-            mode = o1.radio("Output", ["One PPT with all outlets", "One PPT per outlet (ZIP)"], horizontal=True)
-            per_part = o2.number_input(
-                "Outlets per file", min_value=10, max_value=200, value=DEFAULT_OUTLETS_PER_PPT, step=10,
-                help="Big jobs are split into several files so the app does not run out of memory. "
-                     "If the app still crashes, lower this number.")
+            # ---- split by any Excel column (optional) ----
+            s1, s2 = st.columns([2, 3])
+            split_on = s1.toggle("Split by column", value=False,
+                                 help="Make a separate PPT for each value of one column, e.g. each Zone. "
+                                      "Add a helper column (like Branch) in your Excel first if you need one.")
+            split_col = None
+            if split_on:
+                zi = pick(named, "zone", default=pick(named, "region", default=0))
+                split_col = s2.selectbox("Column to split by", named, index=zi, key="split_col_ppt")
 
             cols = {"front": front_col, "before": before_col, "after": after_col, "code": code_col,
                     "client": None if client_col == NONE else client_col,
                     "name": None if name_col == NONE else name_col,
                     "city": None if city_col == NONE else city_col,
                     "state": None if state_col == NONE else state_col,
-                    "campaign": None if camp_col == NONE else camp_col}
+                    "campaign": None if camp_col == NONE else camp_col,
+                    "split": split_col}
             entries = build_entries(ws, headers, cols, rows, {k for k, _ in active}) if active else []
+            groups = split_entries(entries) if (split_on and entries) else {}
+            # best fit: the largest group (or all outlets) in one file, up to the limit; above it equal-sized files
+            auto_fit = good_fit(max((len(v) for v in groups.values()), default=len(entries)))
+
+            o1, o2 = st.columns([3, 2])
+            mode = o1.radio("Output", ["One PPT with all outlets", "One PPT per outlet (ZIP)"], horizontal=True,
+                            disabled=split_on,
+                            help="Not available together with “Split by column”." if split_on else None)
+            if split_on:
+                mode = "One PPT with all outlets"
+            per_part = o2.number_input(
+                "Outlets per file", min_value=1, max_value=MAX_OUTLETS_PER_PPT, value=auto_fit, step=10,
+                key=f"per_part_{auto_fit}",
+                help=f"Set automatically for the best fit (up to {MAX_OUTLETS_PER_PPT} outlets per file; "
+                     "more outlets are shared equally over several files). You can change it. "
+                     "If the app crashes, lower this number.")
+            if int(per_part) > 300:
+                st.caption("⚠️ Files with more than 300 outlets can be several hundred MB and need a computer "
+                           "with plenty of free memory. Lower the number if the app stops.")
+
             if entries:
                 st.caption("Header preview: " + entries[0]["title"]
                            + (f"   |   Welcome slide: {entries[0]['campaign']}" if entries[0]["campaign"] else ""))
             all_urls = list(dict.fromkeys(u for e in entries for k, _ in active for u in e[k]))
-            n_files = math.ceil(len(entries) / int(per_part)) if entries else 0
+            if groups:
+                st.caption(f"Split by “{split_col}”: " + ", ".join(f"{k} ({len(v)})" for k, v in groups.items()))
+                if "Unassigned" in groups:
+                    st.warning(f"{len(groups['Unassigned'])} outlet(s) have no value in “{split_col}” "
+                               "and go into Unassigned.pptx.")
+                n_files = sum(math.ceil(len(v) / int(per_part)) for v in groups.values())
+            else:
+                n_files = math.ceil(len(entries) / int(per_part)) if entries else 0
             st.caption(f"{len(entries)} outlet slide{'s' if len(entries) != 1 else ''}, {len(all_urls)} images"
-                       + (f"  →  {n_files} file{'s' if n_files != 1 else ''}" if n_files > 1 else ""))
+                       + (f"  →  {n_files} files in one ZIP" if n_files > 1 and mode.startswith("One PPT with")
+                          else f"  →  {n_files} files" if n_files > 1 else "  →  1 PPT file"))
 
             if st.button("Create PPT", type="primary", disabled=not entries, key="go_ppt"):
                 st.session_state.pop("ppt_result", None)
                 per_outlet_zip = not mode.startswith("One PPT with")
-                parts, failures, total = create_ppt_parts(entries, active, logo_bytes, w_sub, show_titles,
-                                                          per_outlet_zip, int(per_part))
+                parts, failures, total, zipped = create_ppt_parts(
+                    entries, active, logo_bytes, w_sub, show_titles, per_outlet_zip, int(per_part), split_col)
+                is_zip = per_outlet_zip or zipped
                 st.session_state["ppt_result"] = {
                     "parts": parts, "failures": failures, "total": total,
-                    "mime": "application/zip" if per_outlet_zip else
+                    "mime": "application/zip" if is_zip else
                             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    "label": "Download ZIP of PPTs" if per_outlet_zip else "Download PPT",
+                    "label": "Download ZIP of PPTs" if is_zip else "Download PPT",
                 }
 
         pres = st.session_state.get("ppt_result")
